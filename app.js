@@ -3,3 +3,4 @@ function greet(name) {
 }
 
 console.log(greet("AppSec"));
+console.log("Security gate clean PR test");
