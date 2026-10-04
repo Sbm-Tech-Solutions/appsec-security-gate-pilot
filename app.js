@@ -3,13 +3,24 @@ const mysql = require("mysql");
 
 const app = express();
 
-app.get("/user", (req, res) => {
+const connection = mysql.createConnection({
+  host: "localhost",
+  user: "test",
+  database: "test"
+});
+
+app.get("/user", function(req, res) {
   const username = req.query.username;
 
-  const query =
-    "SELECT * FROM users WHERE username = '" + username + "'";
+  connection.query(
+    "SELECT * FROM users WHERE username = '" + username + "'",
+    function(error, results) {
+      if (error) {
+        res.status(500).send("Error");
+        return;
+      }
 
-  connection.query(query, (error, results) => {
-    res.json(results);
-  });
+      res.json(results);
+    }
+  );
 });
