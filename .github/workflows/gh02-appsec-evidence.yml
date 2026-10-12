@@ -1,0 +1,33 @@
+
+name: GH02 AppSec Evidence Authentication Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-app-auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APPSEC_APP_ID }}
+          private-key: ${{ secrets.APPSEC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-security-events: read
+          permission-issues: write
+
+      - name: Verify GitHub App authentication
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api /repos/${{ github.repository }} --jq '.full_name'
+          echo "GitHub App authentication successful"
+  
