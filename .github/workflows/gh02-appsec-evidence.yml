@@ -22,9 +22,15 @@ on:
         type: string
 
       dismissal_reason:
-        description: "Developer original justification"
+        description: "Original developer justification"
         required: false
         type: string
+
+      developer_username:
+        description: "Developer username, if lookup is unavailable"
+        required: false
+        type: string
+        default: "shastyblinksmartin"
 
       appsec_questions:
         description: "Additional evidence requested by AppSec"
@@ -33,7 +39,7 @@ on:
         default: "Explain why this finding is not exploitable and provide supporting evidence."
 
       create_issue:
-        description: "Create evidence Issue"
+        description: "Create or update evidence Issue"
         required: true
         type: boolean
         default: false
@@ -62,7 +68,7 @@ jobs:
           permission-security-events: read
           permission-issues: write
 
-      - name: Retrieve CodeQL metadata and prepare evidence
+      - name: Retrieve CodeQL metadata and manage evidence
         shell: bash
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -71,6 +77,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pull_request }}
           DISMISSAL_URL: ${{ inputs.dismissal_request_url }}
           DISMISSAL_REASON: ${{ inputs.dismissal_reason }}
+          DEVELOPER_USERNAME: ${{ inputs.developer_username }}
           APPSEC_QUESTIONS: ${{ inputs.appsec_questions }}
           CREATE_ISSUE: ${{ inputs.create_issue }}
 
@@ -88,6 +95,9 @@ jobs:
           repo = os.environ["GH_REPO"]
           alert_num = os.environ["ALERT_NUMBER"].strip()
           pr_num = os.environ.get("PR_NUMBER", "").strip()
+          developer = os.environ.get(
+              "DEVELOPER_USERNAME", ""
+          ).strip()
           create_issue = (
               os.environ.get("CREATE_ISSUE", "false").lower()
               == "true"
@@ -97,7 +107,13 @@ jobs:
               sys.exit("Invalid alert number")
 
           if pr_num and not re.fullmatch(r"[1-9][0-9]*", pr_num):
-              sys.exit("Invalid pull request number")
+              sys.exit("Invalid PR number")
+
+          if developer and not re.fullmatch(
+              r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?",
+              developer
+          ):
+              sys.exit("Invalid developer username")
 
           def api(path, method="GET", payload=None):
               command = [
@@ -121,19 +137,18 @@ jobs:
 
               if result.returncode != 0:
                   raise RuntimeError(
-                      "GitHub API request failed: "
-                      + result.stderr.strip()
+                      f"GitHub API error: {result.stderr.strip()}"
                   )
 
-              return json.loads(result.stdout) if result.stdout.strip() else {}
+              return (
+                  json.loads(result.stdout)
+                  if result.stdout.strip() else {}
+              )
 
-          def safe(value):
-              return str(value if value is not None else "Unavailable").replace(
-                  "\r", " "
-              ).replace("\n", " ")
-
-          def issue_text(value):
-              return str(value or "").replace("\r", "")
+          def clean(value):
+              return str(
+                  value if value is not None else "Unavailable"
+              ).replace("\r", " ").replace("\n", " ")
 
           # Retrieve CodeQL alert
           alert = api(
@@ -144,8 +159,11 @@ jobs:
           instance = alert.get("most_recent_instance") or {}
           location = instance.get("location") or {}
 
-          finding = rule.get("description") or rule.get("name") or "Unknown finding"
-          rule_id = rule.get("id") or "Unavailable"
+          finding = (
+              rule.get("description")
+              or rule.get("name")
+              or "Unknown finding"
+          )
 
           severity = (
               rule.get("security_severity_level")
@@ -153,18 +171,18 @@ jobs:
               or "Unknown"
           )
 
-          tags = rule.get("tags") or []
+          rule_id = rule.get("id") or "Unavailable"
 
           cwes = sorted({
               f"CWE-{match.group(1)}"
-              for tag in tags
+              for tag in (rule.get("tags") or [])
               if (match := re.search(
                   r"cwe[-/](\d+)", tag, re.IGNORECASE
               ))
-          }, key=lambda item: int(item.split("-")[1]))
+          }, key=lambda x: int(x.split("-")[1]))
 
           file_path = location.get("path") or "Unavailable"
-          start_line = location.get("start_line") or "Unavailable"
+          line = location.get("start_line") or "Unavailable"
           ref = instance.get("ref") or "Unavailable"
 
           alert_url = (
@@ -172,21 +190,42 @@ jobs:
               or f"https://github.com/{repo}/security/code-scanning/{alert_num}"
           )
 
-          # Some API responses omit state
           state = (
               alert.get("state")
               or alert.get("status")
               or "Not returned by API"
           )
 
+          # Validate PR association
+          if pr_num and ref.startswith("refs/pull/"):
+              actual_pr = ref.split("/")[2]
+              if pr_num != actual_pr:
+                  sys.exit(
+                      f"PR mismatch: entered #{pr_num}, "
+                      f"but alert belongs to PR #{actual_pr}"
+                  )
+
+          if not pr_num and ref.startswith("refs/pull/"):
+              pr_num = ref.split("/")[2]
+
           pr_url = (
               f"https://github.com/{repo}/pull/{pr_num}"
               if pr_num else "Not provided"
           )
 
+          # Validate original dismissal reference
           dismissal_url = os.environ.get(
               "DISMISSAL_URL", ""
           ).strip()
+
+          if dismissal_url:
+              parsed = urlparse(dismissal_url)
+              if (
+                  parsed.scheme != "https"
+                  or parsed.hostname != "github.com"
+                  or not parsed.path.startswith(f"/{repo}/")
+              ):
+                  sys.exit("Invalid dismissal reference URL")
 
           dismissal_reason = os.environ.get(
               "DISMISSAL_REASON", ""
@@ -196,78 +235,68 @@ jobs:
               "APPSEC_QUESTIONS", ""
           ).strip()
 
-          # Validate original dismissal request URL
-          if dismissal_url:
-              parsed = urlparse(dismissal_url)
-              if (
-                  parsed.scheme != "https"
-                  or parsed.hostname != "github.com"
-                  or not parsed.path.startswith(f"/{repo}/")
-              ):
-                  sys.exit(
-                      "Dismissal URL must belong to the pilot repository"
-                  )
+          # Request lookup status
+          # Organization dismissal requests require a separate
+          # verified API lookup and request identifier.
+          # Never infer requester identity from the PR author.
+          requester_source = (
+              "Manual pilot input"
+              if developer else "Not verified"
+          )
 
-          # Prepare metadata output
-          metadata = {
-              "alert_number": alert_num,
-              "finding": finding,
-              "severity": severity,
-              "rule_id": rule_id,
-              "cwe": cwes,
-              "file": file_path,
-              "line": start_line,
-              "ref": ref,
-              "state": state,
-              "alert_url": alert_url,
-              "pull_request": pr_url
-          }
+          print("CodeQL metadata retrieved successfully")
+          print("Alert:", alert_num)
+          print("Finding:", finding)
+          print("Severity:", severity)
+          print("CWEs:", ", ".join(cwes))
+          print("File:", file_path)
+          print("Line:", line)
+          print("PR:", pr_num or "Unavailable")
+          print("Developer:", developer or "Not verified")
 
-          print("CodeQL metadata retrieved:")
-          print(json.dumps(metadata, indent=2))
-
-          # Create a unique identifier for duplicate checking
           marker = f"<!-- gh02-evidence:{repo}:{alert_num} -->"
 
           body = f"""## Security Alert Information
 
-          **Finding:** {safe(finding)}
+          **Finding:** {clean(finding)}
 
-          **Severity:** {safe(severity)}
+          **Severity:** {clean(severity)}
 
-          **CWE:** {", ".join(cwes) if cwes else "Not available"}
+          **CWE:** {", ".join(cwes) or "Unavailable"}
 
           **CWE Description:** Refer to https://cwe.mitre.org/
 
-          **CodeQL Rule ID:** {safe(rule_id)}
+          **CodeQL Rule ID:** {clean(rule_id)}
 
           **Repository:** {repo}
 
-          **Affected File:** {safe(file_path)}
+          **Affected File:** {clean(file_path)}
 
-          **Line Number:** {safe(start_line)}
+          **Line Number:** {clean(line)}
 
-          **Source to Sink Path:** Review the original CodeQL alert for available data flow information.
+          **Source to Sink Path:** Review original CodeQL alert.
 
           **Pull Request:** {pr_url}
 
           **Alert URL:** {alert_url}
 
-          **Alert Status:** {safe(state)}
+          **Alert Status:** {clean(state)}
 
-          **Affected Ref:** {safe(ref)}
+          **Affected Ref:** {clean(ref)}
 
           ## Original Dismissal Request
 
           **Request URL:** {dismissal_url or "Not provided"}
 
-          **Requested Disposition:** Verify in original GitHub request.
+          **Requested Disposition:** Verify in original request.
 
-          **Developer:** Verify in original GitHub request.
+          **Developer:** {developer or "Not verified"}
 
-          **Original Developer Justification:**
+          **Developer Source:** {requester_source}
 
-          {issue_text(dismissal_reason) or "Not provided. Refer to original dismissal request."}
+          **Original Justification:**
+
+          {dismissal_reason or "Not provided"}
 
           **Request Date:** Verify in GitHub.
 
@@ -277,39 +306,35 @@ jobs:
 
           ## AppSec Evidence Request
 
-          {issue_text(questions)}
+          {questions}
 
           ## Developer Justification
 
           Explain why this finding should be dismissed.
 
-          Provide the relevant code references and execution context.
-
           ## Supporting Evidence
 
           Provide:
-
           - Relevant code references
           - Screenshots or test results
-          - Input validation evidence
-          - Relevant security controls
+          - Security validation evidence
           - Supporting documentation
 
-          Do not include credentials or sensitive information.
+          Do not include secrets or credentials.
 
           ## Production Impact
 
-          Is the affected code deployed or executable in production?
+          Is this code deployed or executable in production?
 
-          Explain the potential security impact.
+          Explain the security impact.
 
           ## Compensating Controls
 
-          Describe existing security controls and how they are enforced.
+          Describe existing security controls.
 
           ## Developer Response
 
-          Provide answers to the AppSec questions and links to evidence.
+          Provide answers to AppSec questions and evidence links.
 
           ## AppSec Decision
 
@@ -325,7 +350,8 @@ jobs:
 
           **Original Dismissal Request Status:** Verify in GitHub
 
-          The original GitHub dismissal request remains the authoritative approval record. Closing this Issue does not approve or deny the security finding.
+          Closing this Issue does not approve or deny the original
+          GitHub dismissal request.
 
           {marker}
           """
@@ -335,32 +361,39 @@ jobs:
               for line in body.splitlines()
           )
 
-          # Write safe execution summary
+          # Execution summary
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
               summary.write("## GH02 AppSec Evidence Automation\n\n")
               summary.write(f"Alert: #{alert_num}\n\n")
-              summary.write(f"Finding: {safe(finding)}\n\n")
-              summary.write(f"Severity: {safe(severity)}\n\n")
-              summary.write(f"CWE: {', '.join(cwes) or 'Unavailable'}\n\n")
+              summary.write(f"Finding: {clean(finding)}\n\n")
+              summary.write(f"Severity: {clean(severity)}\n\n")
               summary.write(
-                  f"Mode: {'Create Issue' if create_issue else 'Preview Only'}\n"
+                  f"CWE: {', '.join(cwes) or 'Unavailable'}\n\n"
+              )
+              summary.write(
+                  f"Developer: {developer or 'Not verified'}\n\n"
+              )
+              summary.write(
+                  f"Mode: {'Create or Update' if create_issue else 'Preview Only'}\n"
               )
 
           if not create_issue:
-              print("PREVIEW ONLY: No Issue created.")
+              print("Preview completed. No Issue modified.")
               sys.exit(0)
 
           if not dismissal_url:
               sys.exit(
-                  "Original dismissal request URL is required to create an Issue"
+                  "Dismissal reference URL is required for Issue creation"
               )
 
-          # Prevent duplicate evidence Issues
+          # Find existing Issue to avoid duplicates
+          existing = None
           page = 1
 
           while True:
               issues = api(
-                  f"/repos/{repo}/issues?state=all&per_page=100&page={page}"
+                  f"/repos/{repo}/issues"
+                  f"?state=all&per_page=100&page={page}"
               )
 
               for issue in issues:
@@ -368,18 +401,66 @@ jobs:
                       continue
 
                   if marker in (issue.get("body") or ""):
-                      print(
-                          "Existing evidence Issue:",
-                          issue.get("html_url")
-                      )
-                      sys.exit(0)
+                      existing = issue
+                      break
 
-              if len(issues) < 100:
+              if existing or len(issues) < 100:
                   break
 
               page += 1
 
-          # Create evidence Issue
+          # Validate developer is assignable
+          assignees = []
+
+          if developer:
+              result = subprocess.run(
+                  [
+                      "gh", "api",
+                      f"/repos/{repo}/assignees/{developer}"
+                  ],
+                  capture_output=True,
+                  text=True
+              )
+
+              if result.returncode == 0:
+                  assignees = [developer]
+              else:
+                  print(
+                      "Developer is not assignable. "
+                      "Issue will require manual assignment."
+                  )
+
+          if existing:
+              issue_number = existing["number"]
+
+              print(
+                  "Existing evidence Issue found:",
+                  existing["html_url"]
+              )
+
+              current_assignees = [
+                  user["login"]
+                  for user in existing.get("assignees", [])
+              ]
+
+              if (
+                  developer
+                  and assignees
+                  and developer.lower() not in [
+                      x.lower() for x in current_assignees
+                  ]
+              ):
+                  api(
+                      f"/repos/{repo}/issues/{issue_number}/assignees",
+                      method="POST",
+                      payload={"assignees": assignees}
+                  )
+
+                  print("Developer assigned:", developer)
+
+              print("Duplicate Issue creation prevented.")
+              sys.exit(0)
+
           title = (
               f"[AppSec Evidence Required] "
               f"CodeQL #{alert_num}: {finding}"
@@ -394,14 +475,18 @@ jobs:
               ]
           }
 
+          if assignees:
+              payload["assignees"] = assignees
+
           created = api(
               f"/repos/{repo}/issues",
               method="POST",
               payload=payload
           )
 
+          print("Evidence Issue created:", created["html_url"])
           print(
-              "Evidence Issue created:",
-              created.get("html_url")
+              "Assigned developer:",
+              developer if assignees else "Manual assignment required"
           )
           PY
