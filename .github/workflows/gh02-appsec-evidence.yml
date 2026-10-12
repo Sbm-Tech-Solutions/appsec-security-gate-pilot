@@ -1,16 +1,54 @@
 
-name: GH02 AppSec Evidence Metadata Test
+name: GH02 AppSec Evidence Automation
 
 on:
   workflow_dispatch:
+    inputs:
+      alert_number:
+        description: "CodeQL alert number"
+        required: true
+        type: string
+        default: "13"
+
+      pull_request:
+        description: "Related PR number"
+        required: false
+        type: string
+        default: "7"
+
+      dismissal_request_url:
+        description: "Original dismissal request URL"
+        required: false
+        type: string
+
+      dismissal_reason:
+        description: "Developer original justification"
+        required: false
+        type: string
+
+      appsec_questions:
+        description: "Additional evidence requested by AppSec"
+        required: true
+        type: string
+        default: "Explain why this finding is not exploitable and provide supporting evidence."
+
+      create_issue:
+        description: "Create evidence Issue"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: gh02-evidence-${{ inputs.alert_number }}
+  cancel-in-progress: false
+
 jobs:
-  test-app-auth:
+  appsec-evidence:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Generate GitHub App token
@@ -22,23 +60,348 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-security-events: read
+          permission-issues: write
 
-      - name: Retrieve CodeQL alert metadata
+      - name: Retrieve CodeQL metadata and prepare evidence
+        shell: bash
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
+          ALERT_NUMBER: ${{ inputs.alert_number }}
+          PR_NUMBER: ${{ inputs.pull_request }}
+          DISMISSAL_URL: ${{ inputs.dismissal_request_url }}
+          DISMISSAL_REASON: ${{ inputs.dismissal_reason }}
+          APPSEC_QUESTIONS: ${{ inputs.appsec_questions }}
+          CREATE_ISSUE: ${{ inputs.create_issue }}
+
         run: |
-          gh api \
-            "/repos/${GH_REPO}/code-scanning/alerts/13" \
-            --jq '{
-              number: .number,
-              state: .state,
-              url: .html_url,
-              severity: .rule.security_severity_level,
-              rule_id: .rule.id,
-              description: .rule.description,
-              cwe: [.rule.tags[]? | select(startswith("external/cwe/cwe-"))],
-              file: .most_recent_instance.location.path,
-              start_line: .most_recent_instance.location.start_line,
-              ref: .most_recent_instance.ref
-            }'
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+          import json
+          import subprocess
+          import sys
+          from urllib.parse import urlparse
+
+          repo = os.environ["GH_REPO"]
+          alert_num = os.environ["ALERT_NUMBER"].strip()
+          pr_num = os.environ.get("PR_NUMBER", "").strip()
+          create_issue = (
+              os.environ.get("CREATE_ISSUE", "false").lower()
+              == "true"
+          )
+
+          if not re.fullmatch(r"[1-9][0-9]*", alert_num):
+              sys.exit("Invalid alert number")
+
+          if pr_num and not re.fullmatch(r"[1-9][0-9]*", pr_num):
+              sys.exit("Invalid pull request number")
+
+          def api(path, method="GET", payload=None):
+              command = [
+                  "gh", "api",
+                  "-H", "Accept: application/vnd.github+json",
+                  path
+              ]
+
+              if method != "GET":
+                  command += ["--method", method]
+
+              if payload is not None:
+                  command += ["--input", "-"]
+
+              result = subprocess.run(
+                  command,
+                  input=json.dumps(payload) if payload is not None else None,
+                  text=True,
+                  capture_output=True
+              )
+
+              if result.returncode != 0:
+                  raise RuntimeError(
+                      "GitHub API request failed: "
+                      + result.stderr.strip()
+                  )
+
+              return json.loads(result.stdout) if result.stdout.strip() else {}
+
+          def safe(value):
+              return str(value if value is not None else "Unavailable").replace(
+                  "\r", " "
+              ).replace("\n", " ")
+
+          def issue_text(value):
+              return str(value or "").replace("\r", "")
+
+          # Retrieve CodeQL alert
+          alert = api(
+              f"/repos/{repo}/code-scanning/alerts/{alert_num}"
+          )
+
+          rule = alert.get("rule") or {}
+          instance = alert.get("most_recent_instance") or {}
+          location = instance.get("location") or {}
+
+          finding = rule.get("description") or rule.get("name") or "Unknown finding"
+          rule_id = rule.get("id") or "Unavailable"
+
+          severity = (
+              rule.get("security_severity_level")
+              or rule.get("severity")
+              or "Unknown"
+          )
+
+          tags = rule.get("tags") or []
+
+          cwes = sorted({
+              f"CWE-{match.group(1)}"
+              for tag in tags
+              if (match := re.search(
+                  r"cwe[-/](\d+)", tag, re.IGNORECASE
+              ))
+          }, key=lambda item: int(item.split("-")[1]))
+
+          file_path = location.get("path") or "Unavailable"
+          start_line = location.get("start_line") or "Unavailable"
+          ref = instance.get("ref") or "Unavailable"
+
+          alert_url = (
+              alert.get("html_url")
+              or f"https://github.com/{repo}/security/code-scanning/{alert_num}"
+          )
+
+          # Some API responses omit state
+          state = (
+              alert.get("state")
+              or alert.get("status")
+              or "Not returned by API"
+          )
+
+          pr_url = (
+              f"https://github.com/{repo}/pull/{pr_num}"
+              if pr_num else "Not provided"
+          )
+
+          dismissal_url = os.environ.get(
+              "DISMISSAL_URL", ""
+          ).strip()
+
+          dismissal_reason = os.environ.get(
+              "DISMISSAL_REASON", ""
+          ).strip()
+
+          questions = os.environ.get(
+              "APPSEC_QUESTIONS", ""
+          ).strip()
+
+          # Validate original dismissal request URL
+          if dismissal_url:
+              parsed = urlparse(dismissal_url)
+              if (
+                  parsed.scheme != "https"
+                  or parsed.hostname != "github.com"
+                  or not parsed.path.startswith(f"/{repo}/")
+              ):
+                  sys.exit(
+                      "Dismissal URL must belong to the pilot repository"
+                  )
+
+          # Prepare metadata output
+          metadata = {
+              "alert_number": alert_num,
+              "finding": finding,
+              "severity": severity,
+              "rule_id": rule_id,
+              "cwe": cwes,
+              "file": file_path,
+              "line": start_line,
+              "ref": ref,
+              "state": state,
+              "alert_url": alert_url,
+              "pull_request": pr_url
+          }
+
+          print("CodeQL metadata retrieved:")
+          print(json.dumps(metadata, indent=2))
+
+          # Create a unique identifier for duplicate checking
+          marker = f"<!-- gh02-evidence:{repo}:{alert_num} -->"
+
+          body = f"""## Security Alert Information
+
+          **Finding:** {safe(finding)}
+
+          **Severity:** {safe(severity)}
+
+          **CWE:** {", ".join(cwes) if cwes else "Not available"}
+
+          **CWE Description:** Refer to https://cwe.mitre.org/
+
+          **CodeQL Rule ID:** {safe(rule_id)}
+
+          **Repository:** {repo}
+
+          **Affected File:** {safe(file_path)}
+
+          **Line Number:** {safe(start_line)}
+
+          **Source to Sink Path:** Review the original CodeQL alert for available data flow information.
+
+          **Pull Request:** {pr_url}
+
+          **Alert URL:** {alert_url}
+
+          **Alert Status:** {safe(state)}
+
+          **Affected Ref:** {safe(ref)}
+
+          ## Original Dismissal Request
+
+          **Request URL:** {dismissal_url or "Not provided"}
+
+          **Requested Disposition:** Verify in original GitHub request.
+
+          **Developer:** Verify in original GitHub request.
+
+          **Original Developer Justification:**
+
+          {issue_text(dismissal_reason) or "Not provided. Refer to original dismissal request."}
+
+          **Request Date:** Verify in GitHub.
+
+          **Request Expiration:** Verify in GitHub.
+
+          **Request Status:** Verify in GitHub.
+
+          ## AppSec Evidence Request
+
+          {issue_text(questions)}
+
+          ## Developer Justification
+
+          Explain why this finding should be dismissed.
+
+          Provide the relevant code references and execution context.
+
+          ## Supporting Evidence
+
+          Provide:
+
+          - Relevant code references
+          - Screenshots or test results
+          - Input validation evidence
+          - Relevant security controls
+          - Supporting documentation
+
+          Do not include credentials or sensitive information.
+
+          ## Production Impact
+
+          Is the affected code deployed or executable in production?
+
+          Explain the potential security impact.
+
+          ## Compensating Controls
+
+          Describe existing security controls and how they are enforced.
+
+          ## Developer Response
+
+          Provide answers to the AppSec questions and links to evidence.
+
+          ## AppSec Decision
+
+          **Status:** Awaiting Developer Evidence
+
+          **Decision:** Pending
+
+          **Reviewer:** TBD
+
+          **Decision Rationale:** Pending
+
+          **Review Date:** Pending
+
+          **Original Dismissal Request Status:** Verify in GitHub
+
+          The original GitHub dismissal request remains the authoritative approval record. Closing this Issue does not approve or deny the security finding.
+
+          {marker}
+          """
+
+          body = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in body.splitlines()
+          )
+
+          # Write safe execution summary
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("## GH02 AppSec Evidence Automation\n\n")
+              summary.write(f"Alert: #{alert_num}\n\n")
+              summary.write(f"Finding: {safe(finding)}\n\n")
+              summary.write(f"Severity: {safe(severity)}\n\n")
+              summary.write(f"CWE: {', '.join(cwes) or 'Unavailable'}\n\n")
+              summary.write(
+                  f"Mode: {'Create Issue' if create_issue else 'Preview Only'}\n"
+              )
+
+          if not create_issue:
+              print("PREVIEW ONLY: No Issue created.")
+              sys.exit(0)
+
+          if not dismissal_url:
+              sys.exit(
+                  "Original dismissal request URL is required to create an Issue"
+              )
+
+          # Prevent duplicate evidence Issues
+          page = 1
+
+          while True:
+              issues = api(
+                  f"/repos/{repo}/issues?state=all&per_page=100&page={page}"
+              )
+
+              for issue in issues:
+                  if "pull_request" in issue:
+                      continue
+
+                  if marker in (issue.get("body") or ""):
+                      print(
+                          "Existing evidence Issue:",
+                          issue.get("html_url")
+                      )
+                      sys.exit(0)
+
+              if len(issues) < 100:
+                  break
+
+              page += 1
+
+          # Create evidence Issue
+          title = (
+              f"[AppSec Evidence Required] "
+              f"CodeQL #{alert_num}: {finding}"
+          )[:240]
+
+          payload = {
+              "title": title,
+              "body": body,
+              "labels": [
+                  "security-disposition-review",
+                  "status:awaiting-developer"
+              ]
+          }
+
+          created = api(
+              f"/repos/{repo}/issues",
+              method="POST",
+              payload=payload
+          )
+
+          print(
+              "Evidence Issue created:",
+              created.get("html_url")
+          )
+          PY
