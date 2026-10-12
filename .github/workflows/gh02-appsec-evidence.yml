@@ -1,5 +1,5 @@
 
-name: GH02 AppSec Evidence Authentication Test
+name: GH02 AppSec Evidence Metadata Test
 
 on:
   workflow_dispatch:
@@ -22,12 +22,23 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-security-events: read
-          permission-issues: write
 
-      - name: Verify GitHub App authentication
+      - name: Retrieve CodeQL alert metadata
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh api /repos/${{ github.repository }} --jq '.full_name'
-          echo "GitHub App authentication successful"
-  
+          gh api \
+            "/repos/${GH_REPO}/code-scanning/alerts/13" \
+            --jq '{
+              number: .number,
+              state: .state,
+              url: .html_url,
+              severity: .rule.security_severity_level,
+              rule_id: .rule.id,
+              description: .rule.description,
+              cwe: [.rule.tags[]? | select(startswith("external/cwe/cwe-"))],
+              file: .most_recent_instance.location.path,
+              start_line: .most_recent_instance.location.start_line,
+              ref: .most_recent_instance.ref
+            }'
